@@ -1,592 +1,472 @@
-"""Draw "The World Today" -- a one-page newspaper poster summing up the
-world news of Saturday 21 November 2026.
-
-Pure Python 3 standard library: no network, no third-party packages.
-Renders text from embedded 1-bit bitmap glyphs (fontdata.py), draws a
-dotted world map from hand-written continent outlines, and writes a
-deterministic PNG (fixed zlib level, no timestamps) to the output path.
-
-Stories were compiled on 21 Nov 2026 from wire reports (BBC News,
-France 24, CBS News, El Pais, The Guardian, Al Jazeera, Reuters, PBS
-NewsHour, Sky News, The Japan Times, Yonhap, UPI, Middle East Eye,
-The National, Euronews, The Straits Times, The Hindu). Every figure
-below is stated as the reporting outlets reported it.
+#!/usr/bin/env python3
+"""Draw "The World Today" — 21 November 2026. Pure stdlib: bitmap fonts from
+fontdata.py, PNG encoded with zlib/struct. Deterministic: same bytes every run.
+Layout (1024x1024): masthead, 3 hero panels, markets ticker, 20-story numbered
+grid, dotted world map with 12 numbered pins, "Also on" list, sources footer.
 """
-
-import base64
-import math
-import os
 import struct
-import sys
 import zlib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from fontdata import FONTS  # noqa: E402
-
-# ---------------------------------------------------------------- canvas
+import fontdata
 
 W, H = 1024, 1024
-PAPER = (247, 243, 234)
-INK = (26, 26, 26)
-RED = (176, 42, 32)
-NAVY = (31, 58, 95)
-GRAY = (112, 110, 102)
-RULE = (178, 172, 158)
-MAP_BG = (233, 237, 239)
-LAND = (96, 106, 116)
-TICKER_BG = (22, 22, 22)
-WHITE = (255, 255, 255)
+PAPER = (250, 246, 236)
+INK = (20, 20, 20)
+RED = (180, 35, 24)
+NAVY = (27, 42, 74)
+MAPBLUE = (58, 90, 124)
+LIGHT = (233, 226, 210)
+GREY = (120, 116, 106)
+
+# ---------------------------------------------------------------- fonts
+FONTS = {}
+for _name, _blob, _widths in (("REG", fontdata.REG_BLOB, fontdata.REG_WIDTHS),
+                              ("BOLD", fontdata.BOLD_BLOB, fontdata.BOLD_WIDTHS)):
+    import base64 as _b64
+    _blob_b = _b64.b64decode("".join(_blob))
+    _w = _b64.b64decode("".join(_widths))
+    _glyphs = {}
+    _i = 0
+    for _idx, _ch in enumerate(fontdata.CHARSET):
+        _gw = _blob_b[_i]
+        _gh = _blob_b[_i + 1]
+        _i += 2
+        _nb = (_gw * _gh + 7) // 8 if _gh else 0
+        _glyphs[_ch] = (_gw, _gh, _blob_b[_i:_i + _nb])
+        _i += _nb
+    FONTS[_name] = (_glyphs, _w)
 
 
+def text_width(s, font="REG", scale=1):
+    glyphs, _w = FONTS[font]
+    total = 0
+    for ch in s:
+        g = glyphs.get(ch)
+        if g is None:
+            total += 4 * scale
+        else:
+            total += (g[0] + 1) * scale
+    return total - scale if total else 0
+
+
+def wrap(s, font, scale, max_w):
+    """Greedy word wrap; returns list of lines that fit max_w."""
+    words = s.split(" ")
+    lines = []
+    cur = ""
+    for word in words:
+        trial = word if not cur else cur + " " + word
+        if text_width(trial, font, scale) <= max_w:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            # hard-split a word that alone is too long
+            while text_width(word, font, scale) > max_w and len(word) > 1:
+                cut = len(word)
+                while cut > 1 and text_width(word[:cut], font, scale) > max_w:
+                    cut -= 1
+                lines.append(word[:cut])
+                word = word[cut:]
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+# ---------------------------------------------------------------- canvas
 class Canvas:
     def __init__(self, w, h, bg):
         self.w = w
         self.h = h
         self.px = bytearray(w * h * 3)
-        self.fill_rect(0, 0, w, h, bg)
+        for i in range(0, w * h * 3, 3):
+            self.px[i] = bg[0]
+            self.px[i + 1] = bg[1]
+            self.px[i + 2] = bg[2]
 
-    def set(self, x, y, color):
+    def set(self, x, y, c):
         if 0 <= x < self.w and 0 <= y < self.h:
             i = (y * self.w + x) * 3
-            self.px[i], self.px[i + 1], self.px[i + 2] = color
+            self.px[i] = c[0]
+            self.px[i + 1] = c[1]
+            self.px[i + 2] = c[2]
 
-    def fill_rect(self, x, y, w, h, color):
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(self.w, x + w)
-        y1 = min(self.h, y + h)
-        r, g, b = color
-        for yy in range(y0, y1):
-            base = (yy * self.w + x0) * 3
-            for xx in range(x0, x1):
-                i = base + (xx - x0) * 3
-                self.px[i], self.px[i + 1], self.px[i + 2] = r, g, b
+    def rect(self, x, y, w, h, c):
+        for yy in range(y, y + h):
+            for xx in range(x, x + w):
+                self.set(xx, yy, c)
 
-    def hline(self, x, y, w, color):
-        self.fill_rect(x, y, w, 1, color)
+    def hline(self, x, y, w, c):
+        for xx in range(x, x + w):
+            self.set(xx, y, c)
 
-    def vline(self, x, y, h, color):
-        self.fill_rect(x, y, 1, h, color)
+    def vline(self, x, y, h, c):
+        for yy in range(y, y + h):
+            self.set(x, yy, c)
 
-    def fill_circle(self, cx, cy, r, color):
-        for dy in range(-r, r + 1):
-            dx = int(math.sqrt(r * r - dy * dy))
-            self.hline(cx - dx, cy + dy, 2 * dx + 1, color)
+    def line(self, x0, y0, x1, y1, c):
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.set(x0, y0, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
 
-    def circle(self, cx, cy, r, color):
-        # Midpoint circle outline, 1 px.
-        x, y, d = 0, r, 1 - r
-        pts = []
-        while x <= y:
-            pts += [(cx + x, cy + y), (cx - x, cy + y), (cx + x, cy - y),
-                    (cx - x, cy - y), (cx + y, cy + x), (cx - y, cy + x),
-                    (cx + y, cy - x), (cx - y, cy - x)]
-            if d < 0:
-                d += 2 * x + 3
-            else:
-                d += 2 * (x - y) + 5
-                y -= 1
-            x += 1
-        for px, py in pts:
-            self.set(px, py, color)
+    def circle(self, cx, cy, r, c):
+        import math
+        for deg in range(0, 360):
+            a = math.radians(deg)
+            self.set(int(cx + r * math.cos(a)), int(cy + r * math.sin(a)), c)
 
+    def disc(self, cx, cy, r, c):
+        for yy in range(cy - r, cy + r + 1):
+            for xx in range(cx - r, cx + r + 1):
+                if (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r:
+                    self.set(xx, yy, c)
 
-# ---------------------------------------------------------------- fonts
+    def ring(self, cx, cy, r, c, thick=1):
+        for t in range(thick):
+            self.circle(cx, cy, r - t, c)
 
-_GLYPH_CACHE = {}
+    def text(self, x, y, s, font="REG", scale=1, color=INK):
+        glyphs, _w = FONTS[font]
+        cx = x
+        for ch in s:
+            g = glyphs.get(ch)
+            if g is None:
+                cx += 4 * scale
+                continue
+            gw, gh, bits = g
+            if gh:
+                for gy in range(gh):
+                    for gx in range(gw):
+                        bit = (bits[(gy * gw + gx) // 8] >> (7 - (gy * gw + gx) % 8)) & 1
+                        if bit:
+                            for sy in range(scale):
+                                for sx in range(scale):
+                                    self.set(cx + gx * scale + sx, y + gy * scale + sy, color)
+            cx += (gw + 1) * scale
+        return cx
 
+    def text_center(self, cx, y, s, font="REG", scale=1, color=INK):
+        self.text(cx - text_width(s, font, scale) // 2, y, s, font, scale, color)
 
-def _glyph(font_name, ch):
-    key = (font_name, ch)
-    g = _GLYPH_CACHE.get(key)
-    if g is None:
-        raw = FONTS[font_name]["glyphs"].get(ch)
-        if raw is None:
-            raw = FONTS[font_name]["glyphs"].get("?")
-        head, _, b64 = raw.partition(":")
-        w, h, dx, dy, adv = (int(v) for v in head.split(","))
-        bits = base64.b64decode(b64) if b64 else b""
-        g = (w, h, dx, dy, adv, bits)
-        _GLYPH_CACHE[key] = g
-    return g
+    def para(self, x, y, s, font, scale, max_w, color=INK, leading=14):
+        lines = wrap(s, font, scale, max_w)
+        for i, ln in enumerate(lines):
+            self.text(x, y + i * leading, ln, font, scale, color)
+        return len(lines)
 
+    def to_png(self):
+        raw = bytearray()
+        stride = self.w * 3
+        for y in range(self.h):
+            raw.append(0)
+            raw.extend(self.px[y * stride:(y + 1) * stride])
+        comp = zlib.compress(bytes(raw), 9)
 
-def text_width(font_name, text):
-    return sum(_glyph(font_name, ch)[4] for ch in text)
+        def chunk(typ, data):
+            c = struct.pack(">I", len(data)) + typ + data
+            return c + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
 
-
-def draw_text(cv, font_name, x, y_top, text, color):
-    """Draw text; y_top is the top of the font's em box."""
-    baseline = y_top + FONTS[font_name]["ascent"]
-    pen = x
-    for ch in text:
-        w, h, dx, dy, adv, bits = _glyph(font_name, ch)
-        if w and h:
-            gx = pen + dx
-            gy = baseline + dy
-            for row in range(h):
-                for col in range(w):
-                    bit = row * w + col
-                    if bits[bit >> 3] >> (7 - (bit & 7)) & 1:
-                        cv.set(gx + col, gy + row, color)
-        pen += adv
-    return pen
-
-
-def draw_text_centered(cv, font_name, cx, y_top, text, color):
-    draw_text(cv, font_name, cx - text_width(font_name, text) // 2,
-              y_top, text, color)
-
-
-def wrap_text(font_name, text, max_w, max_lines=None):
-    """Greedy word wrap; returns a list of lines (truncated with ...)."""
-    words = text.split(" ")
-    lines = []
-    cur = ""
-    for word in words:
-        trial = word if not cur else cur + " " + word
-        if text_width(font_name, trial) <= max_w or not cur:
-            cur = trial
-        else:
-            lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
-    if max_lines is not None and len(lines) > max_lines:
-        lines = lines[:max_lines]
-        # Trim the last line until the ellipsis fits.
-        while lines and text_width(font_name, lines[-1] + "\u2026") > max_w:
-            lines[-1] = lines[-1][:-1]
-        lines[-1] = lines[-1] + "\u2026"
-    return lines
+        ihdr = struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
 
 
-def draw_paragraph(cv, font_name, x, y_top, text, max_w, color,
-                   line_h, max_lines=None):
-    lines = wrap_text(font_name, text, max_w, max_lines)
-    for i, line in enumerate(lines):
-        draw_text(cv, font_name, x, y_top + i * line_h, line, color)
-    return y_top + len(lines) * line_h
-
-
-# ---------------------------------------------------------------- png
-
-def write_png(cv, path):
-    raw = bytearray()
-    stride = cv.w * 3
-    for y in range(cv.h):
-        raw.append(0)  # filter: none
-        raw += cv.px[y * stride:(y + 1) * stride]
-    comp = zlib.compress(bytes(raw), 9)
-
-    def chunk(ctype, data):
-        out = struct.pack(">I", len(data)) + ctype + data
-        out += struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
-        return out
-
-    ihdr = struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", ihdr)
-    png += chunk(b"IDAT", comp)
-    png += chunk(b"IEND", b"")
-    with open(path, "wb") as f:
-        f.write(png)
-
-
-# ---------------------------------------------------------------- map
-
-# Rough continent outlines as (lon, lat) points, equirectangular.
-CONTINENTS = [
-    # North America
-    [(-168, 66), (-150, 70), (-135, 69), (-125, 71), (-110, 73), (-95, 80),
-     (-85, 76), (-80, 73), (-70, 70), (-65, 62), (-60, 55), (-55, 52),
-     (-60, 47), (-65, 44), (-70, 42), (-74, 39), (-76, 35), (-80, 32),
-     (-81, 26), (-84, 30), (-89, 29), (-90, 21), (-94, 18), (-97, 16),
-     (-92, 15), (-86, 12), (-83, 9), (-80, 8), (-85, 11), (-90, 14),
-     (-95, 16), (-100, 18), (-105, 20), (-110, 23), (-114, 28),
-     (-117, 33), (-122, 37), (-124, 42), (-124, 48), (-130, 55),
-     (-140, 60), (-150, 61), (-158, 58), (-165, 60), (-168, 66)],
-    # Greenland
-    [(-58, 64), (-52, 60), (-43, 60), (-32, 68), (-25, 70), (-22, 76),
-     (-30, 80), (-45, 81), (-58, 78), (-62, 74), (-58, 64)],
-    # South America
-    [(-79, 9), (-77, 7), (-75, 10), (-72, 12), (-64, 11), (-60, 8),
-     (-54, 6), (-51, 4), (-50, 0), (-44, -3), (-38, -5), (-35, -8),
-     (-38, -15), (-40, -20), (-48, -26), (-52, -32), (-58, -35),
-     (-62, -39), (-65, -43), (-68, -50), (-70, -54), (-73, -50),
-     (-73, -40), (-72, -30), (-70, -20), (-76, -14), (-80, -6),
-     (-81, 0), (-80, 5), (-79, 9)],
-    # Africa
-    [(-17, 15), (-16, 20), (-15, 27), (-10, 31), (-6, 34), (0, 36),
-     (10, 37), (12, 34), (19, 32), (25, 32), (30, 31), (32, 31),
-     (35, 28), (37, 22), (39, 18), (43, 12), (48, 11), (51, 12),
-     (51, 10), (48, 5), (46, 0), (41, -5), (40, -10), (39, -15),
-     (36, -20), (33, -26), (29, -30), (26, -34), (20, -35), (18, -32),
-     (16, -28), (14, -22), (12, -18), (13, -12), (12, -6), (9, 4),
-     (4, 6), (-3, 5), (-8, 5), (-13, 8), (-17, 12), (-17, 15)],
-    # Eurasia
-    [(-10, 36), (-9, 38), (-9, 43), (-4, 44), (-2, 47), (-1, 46),
-     (-4, 48), (-1, 50), (2, 51), (4, 53), (8, 55), (8, 57),
-     (12, 56), (18, 56), (21, 55), (24, 58), (28, 59), (30, 60),
-     (23, 65), (28, 66), (32, 68), (40, 68), (48, 69), (55, 69),
-     (62, 70), (70, 72), (78, 72), (85, 73), (95, 75), (105, 77),
-     (115, 73), (125, 72), (135, 71), (145, 72), (155, 70), (165, 69),
-     (170, 67), (178, 65), (173, 64), (170, 60), (162, 58), (158, 53),
-     (156, 51), (150, 59), (142, 54), (141, 50), (140, 45), (138, 39),
-     (135, 35), (130, 33), (127, 35), (124, 38), (122, 31), (120, 28),
-     (118, 25), (114, 22), (110, 20), (108, 18), (106, 10), (104, 9),
-     (101, 7), (99, 10), (97, 15), (94, 17), (92, 21), (89, 22),
-     (86, 20), (82, 17), (80, 13), (77, 8), (75, 11), (73, 16),
-     (70, 20), (67, 23), (64, 25), (61, 25), (58, 26), (56, 27),
-     (53, 27), (50, 29), (48, 30), (44, 29), (42, 31), (40, 36),
-     (36, 36), (33, 36), (30, 36), (27, 37), (26, 38), (23, 36),
-     (22, 37), (19, 40), (16, 41), (14, 42), (12, 44), (9, 44),
-     (7, 44), (4, 43), (2, 43), (-1, 44), (-2, 43), (-2, 37),
-     (-6, 36), (-9, 37), (-10, 36)],
-    # Australia
-    [(114, -22), (114, -30), (116, -35), (120, -34), (124, -33),
-     (128, -32), (132, -32), (135, -35), (138, -35), (140, -38),
-     (145, -38), (150, -37), (153, -32), (153, -27), (150, -22),
-     (146, -19), (142, -15), (142, -11), (137, -12), (135, -15),
-     (132, -12), (128, -14), (124, -14), (120, -20), (114, -22)],
-    # United Kingdom
-    [(-5, 50), (-3, 53), (-5, 56), (-3, 58), (-1, 57), (0, 53),
-     (1, 51), (-2, 51), (-4, 50), (-5, 50)],
-    # Japan
-    [(130, 31), (132, 33), (134, 34), (137, 35), (139, 37), (140, 39),
-     (141, 41), (142, 43), (144, 44), (143, 42), (141, 40), (140, 36),
-     (137, 35), (134, 34), (131, 33), (130, 31)],
-    # Madagascar
-    [(44, -16), (47, -15), (50, -16), (49, -19), (47, -23), (45, -25),
-     (44, -22), (43, -19), (44, -16)],
-    # Indonesia (key islands, simplified)
-    [(95, 5), (98, 3), (101, 0), (104, -3), (106, -6), (109, -7),
-     (112, -7), (115, -8), (118, -9), (121, -10), (124, -10),
-     (127, -8), (130, -4), (133, -3), (136, -2), (139, -4),
-     (141, -8), (138, -8), (134, -7), (131, -6), (128, -3),
-     (125, 1), (122, 0), (119, 0), (116, 1), (113, 0),
-     (110, 1), (107, 0), (104, 1), (100, 2), (97, 4), (95, 5)],
-    # New Zealand
-    [(167, -45), (169, -43), (172, -41), (174, -39), (176, -38),
-     (178, -38), (176, -40), (174, -42), (171, -44), (168, -46),
-     (167, -45)],
+# ---------------------------------------------------------------- world map
+# 44 rows x 96 cols, '#' = land. Equirectangular, lat 75..-55, lon -180..180.
+MAP = [
+    "                ############    #########          #####        ################################",
+    "              ################# ##########        ######    ####################################",
+    "   #######################################                 #####################################",
+    "   ############################## #######          #############################################",
+    "    ##############################        ###    ###############################################",
+    "     ############################## ##        ##################################################",
+    "               #####################          ##################################################",
+    "               #####################          ##################################################",
+    "                ####################         ###################################################",
+    "               ################              ###########################################        ",
+    "               ################              ############  ############################         ",
+    "               ################              ##########################################         ",
+    "               #################             ####################         #############         ",
+    "               ##################            ########################################           ",
+    "               ###################           ########################################           ",
+    "               ###################           ########################################           ",
+    "               ###################           ########################################           ",
+    "                  ################           ########################################           ",
+    "                    ##############         ###############        ###################           ",
+    "                       ####                ###     #########            #############           ",
+    "                        ####               ####   ############          #############           ",
+    "                         ####              #####   ###########     #### #############           ",
+    "                           ##              ####     ##########           #############          ",
+    "                           ########        ###    ##########             #############          ",
+    "                           #########              ##########             #############          ",
+    "                           #############          ##########             ##############         ",
+    "                           ###########             #########             ##############         ",
+    "                           ###########             #########             #############          ",
+    "                           ###########             ########              ##############         ",
+    "                           ###########              #######                        #####        ",
+    "                           ###########              ##########                ###########       ",
+    "                           ###########              ##########                ###########       ",
+    "                           ###########              #######                   ###########       ",
+    "                           ##########               #######                   ###########       ",
+    "                           #########                #######                    ##########       ",
+    "                           ########                  #####                     ##########     ##",
+    "                           #######                   ####                      ##########     ##",
+    "                           ######                                               ########      ##",
+    "                           #####                                                 ######       ##",
+    "                           ####                                                               ##",
+    "                           ###                                                                ##",
+    "                           ##                                                                   ",
+    "                           ##                                                                   ",
+    "                           ##                                                                   ",
 ]
 
 
-def _point_in_poly(lon, lat, poly):
-    inside = False
-    n = len(poly)
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if ((yi > lat) != (yj > lat)):
-            xinters = (xj - xi) * (lat - yi) / (yj - yi) + xi
-            if lon < xinters:
-                inside = not inside
-        j = i
-    return inside
-
-
-def _on_land(lon, lat):
-    return any(_point_in_poly(lon, lat, poly) for poly in CONTINENTS)
+def map_xy(lat, lon, x0, y0, mw, mh):
+    col = (lon + 180.0) / 360.0 * 96.0
+    row = (75.0 - lat) / 130.0 * 44.0
+    return int(x0 + col / 96.0 * mw), int(y0 + row / 44.0 * mh)
 
 
 # ---------------------------------------------------------------- stories
+# heroes: (kicker, headline, body, figure)
+HEROES = [
+    ("CLIMATE \u00b7 ANTALYA, TURKEY",
+     "COP31 slips into overtime",
+     "Nearly 200 nations haggle past the deadline in Antalya. The slimmed draft drops every mention of fossil fuels \u2014 and a $120bn target.",
+     "1.8\u00b0C"),
+    ("MIDDLE EAST \u00b7 RIYADH",
+     "Riyadh: three missiles downed",
+     "Saudi defences stop the 01:53 barrage, the second strike in days after the tallest tower was hit. Houthis warn airlines away.",
+     "3 DOWN"),
+    ("DISASTER \u00b7 JUNIN, PERU",
+     "M6.7 quake shakes Peru's Andes",
+     "The tremor strikes 129 km deep near Junin at 19:09 local. Buildings sway in the capital, but no deaths or major damage are reported.",
+     "M6.7"),
+]
 
-DATE_LINE = "SATURDAY, 21 NOVEMBER 2026"
-
-HERO1 = {
-    "kicker": "CONFLICT  \u00b7  KYIV, UKRAINE",
-    "headline": "Russia rains 400+ drones and 110 missiles on Ukraine \u2014 two land in Poland",
-    "body": ("Overnight barrage kills at least eight people in Kyiv and "
-             "damages bridges and railway stations; a later strike on "
-             "Kryvyi Rih wounds about 20. Warsaw calls the missiles a "
-             "deliberate provocation. NATO calls it a grave violation of "
-             "allied airspace and scrambles fighter jets."),
-    "strip": "8 killed in Kyiv  \u00b7  Tusk: \u201cdeliberate provocation\u201d  \u00b7  NATO jets scrambled",
-    "lon": 30.5, "lat": 50.5,
-}
-
-HERO2 = {
-    "kicker": "JUSTICE  \u00b7  THE HAGUE",
-    "headline": "World court: Myanmar guilty of Rohingya genocide",
-    "body": ("The ICJ holds a state responsible for genocide for the first "
-             "time; reparations ordered."),
-    "lon": 4.3, "lat": 52.1,
-}
-
-HERO3 = {
-    "kicker": "ECONOMY  \u00b7  NEW YORK",
-    "headline": "AI rout drags S&P 500 3.7% into correction",
-    "body": ("The Nasdaq erases its 2026 gains; Anthropic slides ~11% a day "
-             "after its record debut. Nikkei falls 5.06%."),
-    "lon": -74.0, "lat": 40.7,
-}
-
-# Stories 4-15: number, kicker, headline, body, lon, lat.
+# grid: (number, region, headline, body) — headline <= 2 lines, body <= 2 lines at 209 px
 GRID = [
-    (4, "POLITICS \u00b7 SHENZHEN",
-     "Trump calls Putin \u201ca friend\u201d at summit with Xi",
-     "Trump says Putin wants to end the war. Zelensky: \u201cHe\u2019s a killer.\u201d",
-     114.1, 22.5),
-    (5, "CONFLICT \u00b7 RIYADH",
-     "Saudi coalition downs 3 Houthi missiles at Riyadh",
-     "Third night of alerts over Riyadh; the coalition hits Hodeidah port.",
-     46.7, 24.7),
-    (6, "CONFLICT \u00b7 HORMUZ",
-     "US\u2013Iran war grinds on as talks stall",
-     "Tehran wants diplomacy with guarantees; Trump rejects its terms.",
-     56.5, 26.6),
-    (7, "POLITICS \u00b7 BRUSSELS",
-     "UK and EU sign biggest post-Brexit deals yet",
-     "Three deals on food, carbon and youth mobility; +0.5% growth a year.",
-     4.4, 50.9),
-    (8, "CLIMATE \u00b7 ANTALYA",
-     "COP31 runs past deadline on fossil fuels",
-     "The draft deal omits fossil fuels. The EU warns of a fossil summit.",
-     30.7, 36.9),
-    (9, "HEALTH \u00b7 LONDON",
-     "Cancer pill leaves tumours undetectable in 1 in 12",
-     "Trial pill daraxonrasib stops nearly every tumour growing, experts say.",
-     -0.1, 51.5),
-    (10, "CULTURE \u00b7 NEW YORK",
-     "GTA VI takes $3.8bn on day one",
-     "Rockstar\u2019s game beats every launch and single-day box-office record.",
-     -74.0, 40.7),
-    (11, "SPACE \u00b7 DARMSTADT",
-     "BepiColombo reaches Mercury orbit",
-     "The twin probes flew 10 billion km over eight years to orbit Mercury.",
-     8.7, 49.9),
-    (12, "DISASTER \u00b7 JUN\u00cdN, PERU",
-     "Magnitude 6.7 quake shakes central Peru",
-     "Strong tremor in the Andes is felt in Lima; no casualties at first.",
-     -75.2, -11.2),
-    (13, "TECHNOLOGY \u00b7 WASHINGTON",
-     "FBI crime database reportedly hacked again",
-     "CNN reports the National Crime Information Center was breached.",
-     -77.0, 38.9),
-    (14, "CONFLICT \u00b7 GAZA",
-     "Israeli strikes kill six in Gaza",
-     "Civil defence counts six dead; drones kill seven, Al Jazeera reports.",
-     34.5, 31.5),
-    (15, "SOCIETY \u00b7 BERLIN",
-     "Gen Z protests spread across 25 countries",
-     "Thousands of students march over living costs, rearmament, climate.",
-     13.4, 52.5),
+    (4, "UKRAINE", "Russia fires 400+ drones, 110 missiles",
+     "Three Kyiv bridges hit; at least 8 killed."),
+    (5, "POLAND", "Two Russian missiles land in Poland",
+     "Tusk: deliberate provocation; NATO: grave."),
+    (6, "THE HAGUE", "UN court: Myanmar guilty of genocide",
+     "First time The Hague holds a state liable."),
+    (7, "MARKETS", "S&P 500 falls 3.7% into correction",
+     "Nasdaq wipes out 2026 gain; Nvidia -14%."),
+    (8, "CHINA", "Trump, Xi, Putin meet in Shenzhen",
+     "First trilateral: no nuclear war, ever."),
+    (9, "BRUSSELS", "UK and EU sign biggest post-Brexit deal",
+     "Food, carbon markets, youth mobility."),
+    (10, "SPACE", "BepiColombo reaches Mercury orbit",
+     "Eight-year ESA-JAXA voyage ends at last."),
+    (11, "PHILIPPINES", "Air Niugini 767 lands in Davao",
+     "Engine fire alert; all 146 aboard safe."),
+    (12, "GAZA", "Israeli strikes kill six in Gaza",
+     "Floods swamp tents; settlers attack farms."),
+    (13, "GULF", "Two tankers hit mines off Hormuz",
+     "Fires at sea; a third tanker hit earlier."),
+    (14, "DENMARK", "Denmark expels Russian attache",
+     "Alleged plot to kill rapper near Copenhagen."),
+    (15, "GERMANY", "Merz, Qatar emir sign defence pact",
+     "Doha pledges 15bn euros more investment."),
+    (16, "TECH", "Anthropic falls 11% after debut",
+     "A wake-up call for the whole AI trade."),
+    (17, "HEALTH", "Pill makes pancreatic tumours vanish",
+     "One in 12 patients clear in early trial."),
+    (18, "LOS ANGELES", "Man guilty of starting Palisades fire",
+     "LA jury convicts over the deadly blaze."),
+    (19, "NIGERIA", "Funeral boat capsizes in Nigeria",
+     "Four dead, two children; 300 feared lost."),
+    (20, "SENEGAL", "21 dead as migrant boat sinks off Senegal",
+     "One rescued off Loumpoul; search goes on."),
+    (21, "BRUSSELS", "EU approves 1bn euros more for Ukraine",
+     "Drones and air defence top the package."),
+    (22, "IRAQ", "Iraqi troops enter militia stronghold",
+     "Jurf al-Sakhar taken after a deal."),
+    (23, "NEW YORK", "19 years for Sikh-leader murder plot",
+     "New York sentences Indian man."),
 ]
 
-# Short items for the "Also on" column: (bold lead, rest of line).
-ALSO_ON = [
-    ("Palisades fire arsonist convicted \u2014",
-     "12 dead, 6,800 buildings lost"),
-    ("Denmark expels Russian diplomat",
-     "over alleged plot to kill a rapper"),
-    ("Estonia to shut five Russia crossings",
-     "from 1 December"),
-    ("US loses measles-free status:",
-     "7,700 cases, 13 deaths"),
-    ("Iraq retakes militia stronghold",
-     "Jurf al-Sakhar, held 12 years"),
-    ("Anthropic mathematician claims proof",
-     "of the Riemann hypothesis"),
-    ("Trump: ousted Nvidia chief Huang",
-     "\u201cdeserves a second chance\u201d"),
-    ("Bolsonaro in hospital",
-     "with intestinal obstruction"),
-    ("Spain votes 29 November;",
-     "conservatives gain after debate"),
-    ("CERN finds first evidence",
-     "of an ultra-rare particle decay"),
+# also on: (number, headline) — one line each at 294 px
+ALSO = [
+    (24, "Las Vegas GP qualifying, 03:00"),
+    (25, "Haiti: Salvadoran troops hit by blast"),
+    (26, "Tanzania: Lissu convicted of sedition"),
+    (27, "Cyclone Xavier nears Cook Islands"),
+    (28, "Honda, Toyota recall 1.6m cars"),
+    (29, "Trump: Iran wants a deal"),
+    (30, "Japan buys 8m barrels Saudi crude"),
+    (31, "EU summons Russia's envoy"),
+    (32, "NTSB: upkeep doomed Kamaka Air"),
+    (33, "Oil rises on Iran war fears"),
+    (34, "Zelensky: Crimea bridge 'won't remain'"),
+    (35, "Nepal ends flood-victim search"),
+    (36, "UAE condemns Houthi strikes"),
 ]
 
-TICKER = ("MARKETS   S&P 500 \u22123.7%    Nikkei \u22125.06%    "
-          "Gold \u22123.98%    Bitcoin \u22124.15%    Brent crude ~$90    "
-          "Nat gas +2.99%    Sensex +1.08%")
+# map pins: (story number, lat, lon). Pin 1 is nudged NW of Antalya so it does
+# not sit on top of pin 9 (Gaza) on this scale.
+PINS = [
+    (1, 39.5, 27.0), (2, 24.7, 46.7), (3, -11.1, -75.9), (4, 50.5, 30.5),
+    (5, 50.0, 22.0), (6, 52.1, 4.3), (7, 22.5, 114.1), (8, 7.1, 125.6),
+    (9, 31.5, 34.5), (19, 4.8, 6.1), (20, 15.4, -16.5), (24, 36.2, -115.1),
+]
 
-SOURCES = ("Sources: BBC News \u00b7 France 24 \u00b7 CBS News \u00b7 El Pa\u00eds "
-           "\u00b7 The Guardian \u00b7 Al Jazeera \u00b7 Reuters \u00b7 PBS NewsHour "
-           "\u00b7 Sky News \u00b7 The Japan Times \u00b7 Yonhap \u00b7 UPI "
-           "\u00b7 Middle East Eye \u00b7 The National \u00b7 Euronews "
-           "\u00b7 The Straits Times \u00b7 The Hindu. Compiled 21 November "
-           "2026 from wire reports; figures as reported by the outlets named.")
+TICKER = ("S&P 500 -3.70%  \u00b7  NASDAQ -5.28%  \u00b7  NIKKEI -5.06%  \u00b7  "
+          "KOSPI -5.21%  \u00b7  BRENT ~$90  \u00b7  NVIDIA -14%  \u00b7  ANTHROPIC -11%")
 
-
-# ---------------------------------------------------------------- layout
-
-MX = 28           # left/right margin
-CW = W - 2 * MX   # content width: 968
+TIMELINE = ("00:09 PERU QUAKE  \u00b7  01:53 RIYADH ALERT  \u00b7  "
+           "03:00 LAS VEGAS QUALIFYING  \u00b7  12:08 DAVAO LANDING  \u00b7  "
+           "18:24 BEPICOLOMBO BURN")
 
 
-def _map_xy(lon, lat, mx, my, mw, mh):
-    x = mx + (lon + 180.0) / 360.0 * mw
-    y = my + (78.0 - lat) / (78.0 + 58.0) * mh
-    return x, y
+# ---------------------------------------------------------------- drawing
+def draw_hero_art(cv, x, y, w, h, kind):
+    """Small geometric illustration at the bottom of a hero panel.
+    Art box is (x, y, w, h); keep every stroke inside it."""
+    import math
+    if kind == 0:  # COP31: globe + rising arrow + sun
+        cx, cy, r = x + 50, y + 30, 26
+        cv.circle(cx, cy, r, NAVY)
+        cv.circle(cx, cy, r - 5, NAVY)
+        for dy in (-12, 0, 12):
+            half = int(math.sqrt(max(0, r * r - dy * dy)))
+            cv.line(cx - half, cy + dy, cx + half, cy + dy, NAVY)
+        # rising temperature arrow
+        ax = x + 118
+        cv.line(ax, y + 52, ax + 40, y + 16, RED)
+        cv.line(ax + 40, y + 16, ax + 28, y + 16, RED)
+        cv.line(ax + 40, y + 16, ax + 40, y + 28, RED)
+        cv.text(ax + 50, y + 8, "1.8\u00b0C", "BOLD", 2, RED)
+        cv.text(ax + 50, y + 34, "HOTTER", "BOLD", 1, INK)
+        cv.text(ax + 50, y + 48, "THAN 1850s", "BOLD", 1, INK)
+    elif kind == 1:  # Riyadh: radar arcs + missile trails
+        cx, cy = x + 40, y + 50
+        for rr in (14, 24, 34):
+            cv.circle(cx, cy, rr, MAPBLUE)
+        cv.line(cx, cy, cx + 32, cy - 32, MAPBLUE)
+        cv.line(cx, cy, cx + 42, cy - 10, MAPBLUE)
+        for mx, my in ((x + 150, y + 12), (x + 185, y + 26), (x + 220, y + 8)):
+            cv.disc(mx, my, 3, RED)
+            cv.line(mx, my, mx - 26, my + 18, RED)
+        cv.text(x + 140, y + 38, "3 INTERCEPTED", "BOLD", 1, RED)
+        cv.text(x + 140, y + 52, "01:53 ALERT", "BOLD", 1, INK)
+    else:  # Peru: seismic zigzag + mountains
+        cv.line(x + 8, y + 34, x + 60, y + 34, NAVY)
+        pts = [(60, 0), (72, -20), (84, 12), (96, -26), (108, 6), (120, -14),
+               (132, 4), (144, -8), (156, 0)]
+        for (dx0, dy0), (dx1, dy1) in zip(pts, pts[1:]):
+            cv.line(x + 60 + dx0, y + 34 + dy0,
+                    x + 60 + dx1, y + 34 + dy1, RED)
+        cv.line(x + 216, y + 62, x + 252, y + 28, NAVY)
+        cv.line(x + 252, y + 28, x + 288, y + 62, NAVY)
+        cv.line(x + 252, y + 28, x + 244, y + 42, NAVY)
+        cv.line(x + 244, y + 42, x + 262, y + 38, NAVY)
+        cv.text(x + 8, y + 48, "129 KM DEEP", "BOLD", 1, INK)
 
 
-def _leader(cv, x0, y0, x1, y1, color):
-    """Thin 1 px line from a map point to its offset number dot."""
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    while True:
-        cv.set(x0, y0, color)
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x0 += sx
-        if e2 <= dx:
-            err += dx
-            y0 += sy
-
-
-def render(path):
+def draw():
     cv = Canvas(W, H, PAPER)
+    # masthead
+    cv.text_center(512, 10, "SATURDAY, 21 NOVEMBER 2026  \u00b7  36 STORIES  \u00b7  7 REGIONS  \u00b7  EVERY FIGURE ATTRIBUTED",
+                   "BOLD", 1, GREY)
+    cv.text_center(512, 26, "THE WORLD TODAY", "BOLD", 4, INK)
+    cv.rect(24, 76, 976, 3, RED)
+    cv.rect(24, 81, 976, 1, INK)
 
-    # ---- masthead ------------------------------------------------------
-    draw_text_centered(cv, "serif_bold_54", W // 2, 12, "THE WORLD TODAY", INK)
-    cv.hline(MX, 76, CW, INK)
-    cv.hline(MX, 79, CW, INK)
-    draw_text(cv, "sans_10", MX, 86, "ONE DAY, ONE PAGE", GRAY)
-    draw_text_centered(cv, "sans_bold_16", W // 2, 84, DATE_LINE, INK)
-    right = "62 STORIES \u00b7 MOOD: UNEASY"
-    draw_text(cv, "sans_10", W - MX - text_width("sans_10", right), 86,
-              right, GRAY)
-    cv.hline(MX, 104, CW, INK)
+    # hero panels
+    hx = [24, 353, 682]
+    for i, (kicker, head, body, fig) in enumerate(HEROES):
+        x = hx[i]
+        cv.rect(x, 90, 317, 200, (255, 255, 255))
+        cv.rect(x, 90, 317, 1, INK)
+        cv.rect(x, 289, 317, 1, INK)
+        cv.text(x + 10, 98, "%d  %s" % (i + 1, kicker), "BOLD", 1, RED)
+        n = cv.para(x + 10, 116, head, "BOLD", 2, 297, INK, leading=26)
+        by = 116 + n * 26 + 4
+        cv.para(x + 10, by, body, "REG", 1, 297, INK, leading=14)
+        draw_hero_art(cv, x + 10, 224, 297, 64, i)
 
-    # ---- heroes --------------------------------------------------------
-    # Hero 1, left column.
-    hx, hw = MX, 612
-    draw_text(cv, "sans_bold_12", hx, 116, HERO1["kicker"], RED)
-    y = draw_paragraph(cv, "sans_bold_24", hx, 134, HERO1["headline"],
-                       hw, INK, 29, max_lines=3)
-    y = draw_paragraph(cv, "sans_13", hx, y + 8, HERO1["body"], hw,
-                       INK, 17, max_lines=5)
-    cv.fill_rect(hx, 292, hw, 1, RULE)
-    draw_text(cv, "sans_bold_12", hx, 300, HERO1["strip"], NAVY)
+    # markets ticker
+    cv.rect(24, 298, 976, 26, INK)
+    cv.text_center(512, 305, TICKER, "BOLD", 1, (250, 246, 236))
 
-    # Divider + right column with heroes 2 and 3, laid out top to bottom
-    # so nothing can overlap: the divider and hero 3 follow hero 2's end.
-    rx, rw = 664, W - MX - 664
-    cv.vline(652, 116, 204, RULE)
-    draw_text(cv, "sans_bold_12", rx, 116, HERO2["kicker"], RED)
-    y = draw_paragraph(cv, "sans_bold_18", rx, 134, HERO2["headline"],
-                       rw, INK, 21, max_lines=2)
-    y = draw_paragraph(cv, "sans_12", rx, y + 4, HERO2["body"], rw, INK,
-                       14, max_lines=2)
-    cv.hline(rx, y + 8, rw, RULE)
-    y += 18
-    draw_text(cv, "sans_bold_12", rx, y, HERO3["kicker"], RED)
-    y = draw_paragraph(cv, "sans_bold_18", rx, y + 18, HERO3["headline"],
-                       rw, INK, 21, max_lines=2)
-    draw_paragraph(cv, "sans_12", rx, y + 4, HERO3["body"], rw, INK,
-                   14, max_lines=2)
+    # numbered grid: 4 cols x 5 rows
+    gx0, gy0 = 24, 332
+    cw, ch = 235, 68
+    for idx, (num, region, head, body) in enumerate(GRID):
+        col, row = idx % 4, idx // 4
+        x = gx0 + col * (cw + 12)
+        y = gy0 + row * ch
+        cv.hline(x, y, cw, LIGHT)
+        cv.text(x, y + 4, "%02d" % num, "BOLD", 1, RED)
+        cv.text(x + 26, y + 4, region, "BOLD", 1, GREY)
+        n = cv.para(x + 26, y + 18, head, "BOLD", 1, 209, INK, leading=12)
+        cv.para(x + 26, y + 18 + n * 12, body, "REG", 1, 209, INK, leading=12)
 
-    cv.hline(MX, 328, CW, INK)
+    # dotted world map
+    mx0, my0, mw, mh = 24, 700, 620, 224
+    cv.text(24, 680, "THE WORLD \u2014 12 PLACES", "BOLD", 1, INK)
+    cv.text(24 + 300, 680, "EACH NUMBER IS A STORY ON THIS PAGE", "REG", 1, GREY)
+    for r, row in enumerate(MAP):
+        for c, ch in enumerate(row):
+            if ch == "#":
+                px = mx0 + int((c + 0.5) / 96.0 * mw)
+                py = my0 + int((r + 0.5) / 44.0 * mh)
+                cv.disc(px, py, 2, MAPBLUE)
+    for num, lat, lon in PINS:
+        px, py = map_xy(lat, lon, mx0, my0, mw, mh)
+        cv.disc(px, py, 9, RED)
+        cv.ring(px, py, 9, (255, 255, 255), 1)
+        label = str(num)
+        cv.text(px - text_width(label, "BOLD", 1) // 2, py - 6, label, "BOLD", 1, (255, 255, 255))
 
-    # ---- world map -----------------------------------------------------
-    draw_text_centered(cv, "sans_bold_12", W // 2, 338,
-                       "WHERE THE DAY HAPPENED \u2014 15 STORIES ON THE MAP",
-                       INK)
-    map_x, map_y, map_w, map_h = MX, 356, CW, 96
-    cv.fill_rect(map_x, map_y, map_w, map_h, MAP_BG)
-    # Dotted landmass: even screen-space dot grid, each dot kept only
-    # where its lon/lat falls on land.
-    for gy in range(map_y + 3, map_y + map_h, 7):
-        for gx in range(map_x + 3, map_x + map_w, 7):
-            lon = (gx - map_x) / map_w * 360.0 - 180.0
-            lat = 78.0 - (gy - map_y) / map_h * (78.0 + 58.0)
-            if _on_land(lon, lat):
-                cv.fill_circle(gx, gy, 2, LAND)
-    # Numbered story dots: heroes first, then the grid. Crowded spots get
-    # a small pixel offset plus a leader line from the true location, so
-    # no two numbers collide (Europe and the US east coast are dense).
-    dots = [(1, HERO1["lon"], HERO1["lat"], 0, 0),
-            (2, HERO2["lon"], HERO2["lat"], -14, -12),
-            (3, HERO3["lon"], HERO3["lat"], 16, -12)]
-    dots += [(n, lon, lat, 0, 0)
-             for (n, _k, _h, _b, lon, lat) in GRID]
-    offsets = {9: (-22, -8), 7: (0, 14), 11: (22, 8), 15: (18, -14),
-               13: (-14, 8), 10: (16, 10), 8: (22, 12), 14: (-14, 14)}
-    dots = [(n, lon, lat, offsets.get(n, (0, 0))[0],
-             offsets.get(n, (0, 0))[1]) for (n, lon, lat, _dx, _dy) in dots]
-    for n, lon, lat, dx, dy in dots:
-        x, y = _map_xy(lon, lat, map_x, map_y, map_w, map_h)
-        cx, cy = int(x) + dx, int(y) + dy
-        if dx or dy:
-            _leader(cv, int(x), int(y), cx, cy, RED)
-        cv.fill_circle(cx, cy, 8, RED)
-        cv.circle(cx, cy, 8, WHITE)
-        label = str(n)
-        draw_text(cv, "sans_bold_12",
-                  cx - text_width("sans_bold_12", label) // 2, cy - 6,
-                  label, WHITE)
-    draw_text(cv, "sans_10", map_x, 456,
-              "Numbers match the stories below.", GRAY)
-    cv.hline(MX, 470, CW, INK)
+    # also on
+    ax0 = 676
+    cv.text(ax0, 680, "ALSO ON", "BOLD", 1, INK)
+    cv.rect(ax0, 696, 324, 1, INK)
+    ay = 704
+    for n, h in ALSO:
+        cv.text(ax0, ay, "%02d" % n, "BOLD", 1, RED)
+        cv.text(ax0 + 30, ay, h, "REG", 1, INK)
+        ay += 16
 
-    # ---- numbered grid, stories 4-15 ----------------------------------
-    draw_text(cv, "sans_bold_16", MX, 480, "THE DAY IN FULL", INK)
-    right = "STORIES 4\u201315  \u00b7  EUROPE \u00b7 MIDDLE EAST \u00b7 ASIA \u00b7 AMERICAS"
-    draw_text(cv, "sans_10", W - MX - text_width("sans_10", right), 484,
-              right, GRAY)
-    col_w = (CW - 2 * 14) // 3
-    for idx, (n, kicker, headline, body, _lon, _lat) in enumerate(GRID):
-        col = idx % 3
-        row = idx // 3
-        x = MX + col * (col_w + 14)
-        y = 504 + row * 76
-        # Red number tile.
-        cv.fill_rect(x, y, 20, 20, RED)
-        label = str(n)
-        draw_text(cv, "sans_bold_12",
-                  x + 10 - text_width("sans_bold_12", label) // 2, y + 4,
-                  label, WHITE)
-        tx = x + 28
-        tw = col_w - 28
-        draw_text(cv, "sans_bold_12", tx, y, kicker, RED)
-        draw_paragraph(cv, "sans_bold_15", tx, y + 16, headline, tw,
-                       INK, 18, max_lines=2)
-        draw_paragraph(cv, "sans_12", tx, y + 50, body, tw, INK, 13,
-                       max_lines=2)
-
-    cv.hline(MX, 816, CW, INK)
-
-    # ---- also on -------------------------------------------------------
-    draw_text(cv, "sans_bold_12", MX, 826, "ALSO ON THIS DAY", RED)
-    col_w2 = (CW - 20) // 2
-    for idx, (lead, rest) in enumerate(ALSO_ON):
-        col = idx % 2
-        row = idx // 2
-        x = MX + col * (col_w2 + 20)
-        y = 844 + row * 17
-        draw_text(cv, "sans_bold_12", x, y, "\u2022  " + lead, INK)
-        lx = x + text_width("sans_bold_12", "\u2022  " + lead)
-        draw_text(cv, "sans_12", lx, y, " " + rest, INK)
-
-    # ---- markets ticker ------------------------------------------------
-    cv.fill_rect(MX, 936, CW, 30, TICKER_BG)
-    draw_text_centered(cv, "sans_bold_12", W // 2, 945, TICKER, WHITE)
-
-    # ---- footer --------------------------------------------------------
-    draw_paragraph(cv, "sans_10", MX, 974, SOURCES, CW, GRAY, 12,
-                   max_lines=2)
-    draw_text_centered(cv, "sans_bold_12", W // 2, 1004,
-                       "THE WORLD TODAY  \u00b7  SATURDAY 21 NOVEMBER 2026  \u00b7  PAGE 1 OF 1",
-                       INK)
-
-    write_png(cv, path)
+    # footer
+    cv.rect(24, 932, 976, 2, INK)
+    cv.text_center(512, 944, "SOURCES: BBC \u00b7 REUTERS \u00b7 AP \u00b7 AL JAZEERA \u00b7 THE GUARDIAN \u00b7 AFP \u00b7 PBS \u00b7 ONE TURN",
+                   "BOLD", 1, INK)
+    cv.text_center(512, 962, TIMELINE, "REG", 1, INK)
+    cv.text_center(512, 980, "EVERY FIGURE ATTRIBUTED  \u00b7  DATE-CHECKED 21 NOV 2026  \u00b7  36 STORIES  \u00b7  7 REGIONS",
+                   "BOLD", 1, RED)
+    cv.text_center(512, 998, "THE WORLD TODAY \u2014 THE PICTURE OF SATURDAY'S NEWS",
+                   "REG", 1, GREY)
+    return cv
 
 
 def main():
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    render(os.path.join(out_dir, "entry.png"))
+    cv = draw()
+    png = cv.to_png()
+    import os
+    out = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "entry.png"), "wb") as f:
+        f.write(png)
+    print("wrote entry.png", len(png), "bytes")
 
 
 if __name__ == "__main__":
